@@ -1,0 +1,100 @@
+# 将本文件复制到你 Fork 仓库的 .github/workflows/deploy.yml
+# 功能：每周日北京时间 23:00 检查上游 cmliu/edgetunnel 是否有新版本，
+#       有更新且本仓库已同步时，自动部署到 Cloudflare Workers（Worker 名：edgetunnel-auto）。
+# 需要的 GitHub Secrets（仓库 Settings -> Secrets and variables -> Actions 添加）：
+#   CLOUDFLARE_API_TOKEN  - Cloudflare API Token（权限：编辑 Cloudflare Workers 模板）
+#   CLOUDFLARE_ACCOUNT_ID - Cloudflare Account ID
+#   CLOUDFLARE_KV_ID      - KV 命名空间 ID（KV 数据库 id 不是高敏感凭据，但用 Secret 存更稳妥）
+
+name: Deploy edgetunnel to Cloudflare Workers
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "0 15 * * 0" # UTC 周日 15:00 = 北京时间周日 23:00
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制重新部署（忽略版本检查）"
+        type: boolean
+        default: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v6
+
+      - name: 获取上游最新 commit
+        id: upstream
+        run: |
+          SHA=$(curl -sf -H "Authorization: Bearer ${{ github.token }}" \
+            https://api.github.com/repos/cmliu/edgetunnel/commits/main | jq -r .sha)
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::error::无法获取上游 commit SHA"
+            exit 1
+          fi
+          echo "上游最新 SHA: $SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: 确认本仓库已同步到上游
+        id: sync
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          echo "本地 HEAD SHA: $LOCAL"
+          if [ "${{ steps.upstream.outputs.sha }}" != "$LOCAL" ]; then
+            echo "::warning::仓库尚未同步到上游最新版本（每日 Upstream Sync 可能冲突或未运行），本次跳过部署。"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 查询上次已部署版本
+        id: cache
+        if: steps.sync.outputs.ready == 'true'
+        uses: actions/cache@v4
+        with:
+          path: .deploy-marker
+          key: deployed-${{ steps.upstream.outputs.sha }}
+          restore-keys: |
+            deployed-
+
+      - name: 判断是否需要部署
+        id: decide
+        run: |
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "手动触发强制部署"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
+            echo "上游无新版本（该 commit 已部署过），跳过"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "检测到新版本，准备部署"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 只在 CI 环境内临时修改配置，不提交到仓库，避免与上游每日同步产生冲突
+      - name: 生成部署配置
+        if: steps.decide.outputs.deploy == 'true'
+        env:
+          KV_ID: ${{ secrets.CLOUDFLARE_KV_ID }}
+        run: |
+          sed -i 's/^name *=.*/name = "edgetunnel-auto"/' wrangler.toml
+          printf '\n[[kv_namespaces]]\nbinding = "KV"\nid = "%s"\n' "$KV_ID" >> wrangler.toml
+          echo "---- 本次部署使用的 wrangler.toml ----"
+          cat wrangler.toml
+
+      - name: 部署到 Cloudflare Workers
+        if: steps.decide.outputs.deploy == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
+
+      - name: 记录已部署版本
+        if: steps.decide.outputs.deploy == 'true'
+        run: echo "${{ steps.upstream.outputs.sha }}" > .deploy-marker
