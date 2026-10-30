@@ -84,10 +84,19 @@ jobs:
         run: |
           sed -i 's/^name *=.*/name = "edgetunnel-auto"/' wrangler.toml
           printf '\n[[kv_namespaces]]\nbinding = "KV"\nid = "%s"\n' "$KV_ID" >> wrangler.toml
+          mkdir -p dist && cp _worker.js dist/
           echo "---- 本次部署使用的 wrangler.toml ----"
           cat wrangler.toml
 
-      - name: 部署到 Cloudflare Workers
+      - name: 部署到 Cloudflare Pages（主通道）
+        if: steps.decide.outputs.deploy == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=edgetunnel-auto --branch=main --commit-dirty=true
+
+      - name: 部署到 Cloudflare Workers（备用通道）
         if: steps.decide.outputs.deploy == 'true'
         uses: cloudflare/wrangler-action@v3
         with:
